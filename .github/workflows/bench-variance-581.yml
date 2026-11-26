@@ -1,0 +1,79 @@
+name: LeanVM #581 Linux variance pilot
+
+'on': workflow_dispatch
+
+permissions:
+  contents: read
+
+concurrency:
+  group: leanvm-581-linux-variance-pilot
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_SHA: 0884f6060a46944e86cfb39f75171e2c98213b65
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+  VARIANCE_SESSION: '1'
+  VARIANCE_STAGE: pilot
+  VARIANCE_BLOCKS: '6'
+
+jobs:
+  measure:
+    if: github.repository == 'dragan2234/leanVM' && github.ref == 'refs/heads/main'
+    name: Pilot / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 22
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - arch: x86-64
+            runner: ubuntu-latest
+            rustflags: -C target-cpu=haswell
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            rustflags: -C target-cpu=neoverse-n2 -C target-feature=+aes,+sha3
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      VARIANCE_ARCH: ${{ matrix.arch }}
+      VARIANCE_LABEL: ${{ matrix.runner }}
+      VARIANCE_RESULTS: ${{ github.workspace }}/results
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: leanEthereum/leanVM
+          ref: ${{ env.UPSTREAM_SHA }}
+          path: upstream
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Install stable Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - name: Confirm ARM CPU features
+        if: matrix.arch == 'arm64'
+        shell: bash
+        run: |
+          features=$(grep -m1 -E '^Features' /proc/cpuinfo)
+          for f in aes pmull sha3 sve2; do grep -qw "$f" <<< "$features"; done
+      - name: Build benchmark executables
+        shell: bash
+        run: bash control/.github/experiments/leanvm-581/build.sh
+      - name: Measure one allocation
+        working-directory: upstream
+        run: python3 ../control/.github/experiments/leanvm-581/run.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: leanvm-581-pilot-${{ matrix.arch }}-attempt-${{ github.run_attempt }}
+          path: |
+            results/
+            !results/bin/**
+          if-no-files-found: warn
+          retention-days: 14
