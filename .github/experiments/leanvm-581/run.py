@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the pinned #581 pilot or a full allocation. --plan prints a design without running."""
+"""Run one pinned #581 study allocation. --plan prints the schedule without running."""
 import argparse
 from contextlib import contextmanager
 import datetime as dt
@@ -10,14 +10,12 @@ import os
 from pathlib import Path
 import random
 import re
-import shutil
 import subprocess as sp
 import tempfile
 import time
 
 SIZES = (13, 18)
 COOLDOWNS = (0, 100, 500, 1000, 2000)
-THREADS = (1, 2, 4, 8)
 MEASURES_HASHES = {"binary","text"}
 
 def read(path):
@@ -72,35 +70,39 @@ def balanced(n, rng):
     rng.shuffle(orders)
     return orders
 
-def schedule(stage, blocks, cap, rng):
+def cooldown_orders(rng):
+    """A randomized Williams design for five treatments across ten blocks."""
+    treatments = rng.sample(COOLDOWNS, len(COOLDOWNS))
+    template = (0, 1, 4, 2, 3)
+    rotations = [tuple(treatments[(i+j)%len(treatments)] for j in template) for i in range(len(treatments))]
+    orders = rotations + [r[::-1] for r in rotations]
+    rng.shuffle(orders)
+    return orders
+
+def schedule(blocks, control_blocks, rng):
     result = []
-    if stage in ("pilot","aa"):
-        orders = {size: balanced(blocks,rng) for size in SIZES}
-        for b in range(blocks):
-            for size in rng.sample(SIZES,k=2):
-                labels = ("A","A_prime") if orders[size][b]==0 else ("A_prime","A")
-                result.extend(dict(row("aa",label,size,"pristine"),block=b+1,position=i)
-                              for i,label in enumerate(labels,1))
-    if stage in ("pilot","controls"):
-        bridge = balanced(2 if stage=="pilot" else 6,rng)
-        for b, order in enumerate(bridge,1):
-            labels = ("pristine","adapter") if order==0 else ("adapter","pristine")
-            result.extend(dict(row("bridge",label,18,label),block=b,position=i)
+    orders = {size: balanced(blocks,rng) for size in SIZES}
+    for b in range(blocks):
+        for size in rng.sample(SIZES,k=2):
+            labels = ("A","A_prime") if orders[size][b]==0 else ("A_prime","A")
+            result.extend(dict(row("aa",label,size,"pristine"),block=b+1,position=i)
                           for i,label in enumerate(labels,1))
-        for b in range(1,(1 if stage=="pilot" else blocks)+1):
-            groups = [
-                [row("cooldown",str(d),size,"adapter",cooldown=d) for d in COOLDOWNS]
-                for size in SIZES
-            ]
-            groups.extend([
-                [row("threads",str(t) if t else "auto",18,"adapter",threads=t)
-                 for t in (0,*[t for t in THREADS if t<=cap])],
-                [row("contention",str(load),18,"adapter",load=load) for load in (0,1)],
-            ])
-            rng.shuffle(groups)
-            for group in groups:
-                rng.shuffle(group)
-                result.extend(dict(r,block=b,position=i) for i,r in enumerate(group,1))
+
+    for b, order in enumerate(balanced(6,rng),1):
+        labels = ("pristine","adapter") if order==0 else ("adapter","pristine")
+        result.extend(dict(row("bridge",label,18,label),block=b,position=i)
+                      for i,label in enumerate(labels,1))
+
+    cooldown = {size: cooldown_orders(rng) for size in SIZES}
+    contention = balanced(control_blocks,rng)
+    for b in range(control_blocks):
+        load_order = (0,1) if contention[b]==0 else (1,0)
+        groups = [[row("cooldown",str(d),size,"adapter",cooldown=d) for d in cooldown[size][b]]
+                  for size in SIZES]
+        groups.append([row("contention",str(load),18,"adapter",load=load) for load in load_order])
+        rng.shuffle(groups)
+        for group in groups:
+            result.extend(dict(r,block=b+1,position=i) for i,r in enumerate(group,1))
     return [dict(r,sequence=i) for i,r in enumerate(result,1)]
 
 def stamp():
@@ -218,26 +220,32 @@ def save(path, data):
 
 def main():
     parser=argparse.ArgumentParser()
-    parser.add_argument("--plan",type=int,metavar="CPU_CAPACITY",help="print a synthetic schedule only")
+    parser.add_argument("--plan",action="store_true",help="print a synthetic schedule only")
     args=parser.parse_args()
     stage=os.environ["VARIANCE_STAGE"]
     blocks=int(os.environ["VARIANCE_BLOCKS"])
-    session=int(os.environ.get("VARIANCE_SESSION","1"))
-    if (stage, blocks, session) != ("pilot", 6, 1):
-        raise SystemExit("This registration is limited to the six-block pilot.")
-    arch=os.environ.get("VARIANCE_ARCH","fixture")
+    controls=int(os.environ["VARIANCE_CONTROL_BLOCKS"])
+    window=os.environ["VARIANCE_WINDOW"]
+    session=int(os.environ["VARIANCE_SESSION"])
+    arch=os.environ["VARIANCE_ARCH"]
+    allowed={"first":(1,2),"second":(3,4)}
+    if ((stage, blocks, controls)!=("full",30,10) or session not in allowed.get(window,())
+            or arch not in ("x86-64","arm64")):
+        raise SystemExit("Invalid study architecture, window, allocation, or block counts.")
     run_id=os.environ.get("GITHUB_RUN_ID","local")
     attempt=os.environ.get("GITHUB_RUN_ATTEMPT","1")
-    key=(stage,session,arch,run_id,attempt)
+    if attempt!="1":
+        raise SystemExit("Use the first attempt only. Any replacement allocation needs a new review.")
+    key=(stage,window,session,arch,run_id)
     seed=int.from_bytes(hashlib.sha256(repr(key).encode()).digest()[:8],"big")
-    if args.plan is not None:
-        print(json.dumps(schedule(stage,blocks,args.plan,random.Random(seed))))
+    rows=schedule(blocks,controls,random.Random(seed))
+    if args.plan:
+        print(json.dumps(rows))
         return
     root=Path(os.environ["VARIANCE_RESULTS"])
     affinity=sorted(os.sched_getaffinity(0))
     groups=cgroup_paths()
     cap,quotas=capacity(groups,affinity)
-    rows=schedule(stage,blocks,cap,random.Random(seed))
     hashes={}
     for file,name in (("binary-sha256.txt","binary"),("text-sha256.txt","text")):
         for line in (root/file).read_text().splitlines():
@@ -247,30 +255,19 @@ def main():
     assert all(set(value)==MEASURES_HASHES for value in hashes.values())
     save(root/"host-before.json",host(groups,affinity,cap,quotas))
     save(root/"design.json",dict(stage=stage,seed=seed,session=session,arch=arch,run_id=run_id,attempt=attempt,
-                                blocks=blocks,capacity=cap,skipped_fixed_counts=[t for t in THREADS if t>cap],
+                                blocks=blocks,control_blocks=controls,window=window,capacity=cap,
                                 hashes=hashes,rows=rows,first_snapshot=snapshot(groups)))
     try:
         with (root/"runs.jsonl").open("w",buffering=1) as output:
             for r in rows:
                 r["frequency_before_process"]=frequency(affinity)
-                r.update(session=session,arch=arch,run_id=run_id,attempt=attempt,seed=seed)
+                r.update(session=session,window=window,arch=arch,run_id=run_id,attempt=attempt,seed=seed)
                 item=run_one(r,root,groups,hashes)
                 output.write(json.dumps(item)+"\n")
                 if item["status"] or item.get("error"):
                     raise RuntimeError(f"failed benchmark row {item['sequence']}, see runs.jsonl")
                 print(f"{item['sequence']}/{len(rows)} {item['experiment']} {item['log_n']} {item['condition']} {item['proving_ns']/1e6:.3f}ms",flush=True)
-        if stage in ("pilot","aa"):
-            save(root/"pristine-workers.json",[probe_workers(root,size) for size in SIZES])
-        if stage=="pilot":
-            probes=[]
-            if shutil.which("perf"):
-                for events in ("task-clock,context-switches,cpu-migrations","cycles,instructions"):
-                    probe=capture(["perf","stat","-x,","-e",events,"--","true"])
-                    probes.append(probe)
-                    if probe["status"]==0:
-                        probes.append(capture(["perf","stat","-x,","-e",events,"--",str(root/"bin"/"pristine"),"--json"],
-                                              env=clean_env({"log_n":13}),timeout=120))
-            save(root/"perf-probe.json",dict(executable=shutil.which("perf"),probes=probes))
+        save(root/"pristine-workers.json",[probe_workers(root,size) for size in SIZES])
     finally:
         save(root/"host-after.json",host(groups,affinity,cap,quotas))
         save(root/"last-snapshot.json",snapshot(groups))

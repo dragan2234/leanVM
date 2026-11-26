@@ -1,32 +1,45 @@
-name: LeanVM #581 Linux variance pilot
+name: "LeanVM #581 Linux variance study"
 
-'on': workflow_dispatch
+'on':
+  workflow_dispatch:
+    inputs:
+      window:
+        description: First or second predeclared measurement window
+        type: choice
+        required: true
+        options: [first, second]
 
 permissions:
   contents: read
 
 concurrency:
-  group: leanvm-581-linux-variance-pilot
+  group: leanvm-581-linux-variance-study
   cancel-in-progress: false
 
 env:
   UPSTREAM_SHA: 0884f6060a46944e86cfb39f75171e2c98213b65
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: '1'
-  VARIANCE_SESSION: '1'
-  VARIANCE_STAGE: pilot
-  VARIANCE_BLOCKS: '6'
+  RUSTUP_TOOLCHAIN: '1.100.0'
+  VARIANCE_STAGE: full
+  VARIANCE_BLOCKS: '30'
+  VARIANCE_CONTROL_BLOCKS: '10'
 
 jobs:
   measure:
-    if: github.repository == 'dragan2234/leanVM' && github.ref == 'refs/heads/main'
-    name: Pilot / ${{ matrix.arch }}
+    if: >-
+      github.repository == 'dragan2234/leanVM' &&
+      github.ref == 'refs/heads/main' &&
+      github.run_attempt == '1'
+    name: ${{ inputs.window }} / ${{ matrix.arch }} / allocation ${{ matrix.session }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 22
+    timeout-minutes: 40
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 4
       matrix:
+        arch: [x86-64, arm64]
+        session: ${{ fromJSON(inputs.window == 'first' && '[1,2]' || '[3,4]') }}
         include:
           - arch: x86-64
             runner: ubuntu-latest
@@ -36,6 +49,8 @@ jobs:
             rustflags: -C target-cpu=neoverse-n2 -C target-feature=+aes,+sha3
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
+      VARIANCE_WINDOW: ${{ inputs.window }}
+      VARIANCE_SESSION: ${{ matrix.session }}
       VARIANCE_ARCH: ${{ matrix.arch }}
       VARIANCE_LABEL: ${{ matrix.runner }}
       VARIANCE_RESULTS: ${{ github.workspace }}/results
@@ -51,11 +66,13 @@ jobs:
           path: upstream
           fetch-depth: 1
           persist-credentials: false
-      - name: Install stable Rust
+      - name: Install and verify the pilot Rust toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+          metadata=$(rustc -Vv)
+          grep -Fx 'release: 1.100.0' <<< "$metadata"
+          grep -Fx 'commit-hash: 0ef1bc386059596dada8fb65b50425aab2ea637a' <<< "$metadata"
       - name: Confirm ARM CPU features
         if: matrix.arch == 'arm64'
         shell: bash
@@ -66,12 +83,13 @@ jobs:
         shell: bash
         run: bash control/.github/experiments/leanvm-581/build.sh
       - name: Measure one allocation
+        timeout-minutes: 34
         working-directory: upstream
         run: python3 ../control/.github/experiments/leanvm-581/run.py
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
-          name: leanvm-581-pilot-${{ matrix.arch }}-attempt-${{ github.run_attempt }}
+          name: leanvm-581-${{ inputs.window }}-${{ matrix.arch }}-allocation-${{ matrix.session }}-attempt-${{ github.run_attempt }}
           path: |
             results/
             !results/bin/**
